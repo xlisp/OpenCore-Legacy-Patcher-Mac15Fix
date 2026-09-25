@@ -20,6 +20,7 @@
 8. [附录 B：动态壁纸导致 CPU 高占用](#附录-b动态壁纸导致-cpu-高占用)
 9. [附录 C：常见问题 FAQ](#附录-c常见问题-faq)
 10. [附录 D：OCLP 让老 Mac 运行新系统的原理与启动机制](#附录-doclp-让老-mac-运行新系统的原理与启动机制)
+11. [附录 E：macOS 内核（XNU）原理、启动过程及与 Linux 的对比](#附录-emacos-内核xnu原理启动过程及与-linux-的对比)
 
 ---
 
@@ -734,6 +735,291 @@ sudo diskutil unmount disk0s1                                # 看完记得卸�
 defaults read /Users/Shared/.com.dortania.opencore-legacy-patcher.plist
 # 本机可以看到 "GUI:disable_fw_throttle" = 1，即本次开启的降频屏蔽
 ```
+
+---
+
+## 附录 E：macOS 内核（XNU）原理、启动过程及与 Linux 的对比
+
+### E.1 macOS 的整体分层
+
+macOS 的底层叫 **Darwin**，是 Apple 开源的部分：**XNU 内核 + 一套 BSD 风格的用户态基础工具**。Darwin 之上是 Apple 闭源的框架和图形界面。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  应用程序：Finder、Safari、iTerm、Claude Code …               │
+├──────────────────────────────────────────────────────────────┤
+│  应用框架：AppKit / SwiftUI / Foundation                      │  ← 闭源
+│  图形与媒体：Metal、Core Animation、AVFoundation、WindowServer │
+│  核心服务：Core Foundation、XPC、Security、Spotlight …         │
+├──────────────────────────────────────────────────────────────┤
+│  Darwin 用户态：launchd(PID 1)、dyld(动态链接器)、             │  ← 大部分开源
+│                 libSystem(libc 等)、zsh、BSD 命令行工具        │
+├──────────────────────────────────────────────────────────────┤
+│  XNU 内核                                                     │
+│   ┌─────────────┬───────────────────┬─────────────────────┐  │
+│   │   Mach      │     BSD 层        │     IOKit           │  │  ← 开源
+│   │ 任务/线程    │ 进程/POSIX/信号   │ C++ 面向对象驱动框架 │  │
+│   │ 虚拟内存     │ VFS/APFS/网络栈   │ 驱动匹配/电源管理    │  │
+│   │ IPC(端口)    │ 用户/权限/沙盒    │ IORegistry 设备树    │  │
+│   │ 调度器       │ 系统调用          │                     │  │
+│   ├─────────────┴───────────────────┴─────────────────────┤  │
+│   │  libkern（内核 C++ 运行时）  Platform Expert（平台抽象） │  │
+│   └─────────────────────────────────────────────────────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│  硬件：Intel CPU / SMC / 显卡 / 存储 / …                       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+本机内核版本：
+
+```bash
+❯ uname -a
+Darwin ... 24.6.0 Darwin Kernel Version 24.6.0: Sun Aug 23 20:30:56 PDT 2026;
+root:xnu-11417.140.69.712.69~1/RELEASE_X86_64 x86_64
+```
+
+- `Darwin 24.6.0` 对应 macOS 15.6 之后的 15.x 系列（Darwin 大版本号 = macOS 大版本号 + 9）；
+- `xnu-11417...` 是 XNU 的源码版本号；
+- `RELEASE_X86_64` 表示这是 Intel 版的正式发布内核。
+
+### E.2 XNU 是什么？
+
+**XNU = “X is Not Unix”**。它来自 NeXT 公司的 NeXTSTEP 系统（乔布斯离开苹果后创办的公司，1997 年被苹果收购）。它是一个**混合内核**，由三大块组成：
+
+#### 1) Mach：内核最底层
+
+来源于卡内基梅隆大学的 Mach 微内核。负责最基础的几件事：
+
+- **任务（task）和线程（thread）**：task 是资源容器，相当于进程的“骨架”；
+- **虚拟内存**：页表、内存对象、写时复制；
+- **调度器**：决定哪个线程在哪个 CPU 核上跑，支持 QoS 服务质量等级（用户交互 > 用户发起 > 实用工具 > 后台）；
+- **IPC（进程间通信）**：基于**Mach 端口（port）**的消息传递。这是 macOS 最核心的通信机制。
+
+> 🔗 **和本次问题的联系**：你在活动监视器里看到的各种 `xxx.xpc` 进程，就是基于 Mach 端口的 **XPC 服务**。macOS 把大量功能拆成一个个独立的小服务进程，通过 XPC 通信。这就是为什么 `ps` 能列出几百个进程。CPU 被锁在 800MHz 时，这些服务全都会变慢，看起来就像某个 XPC 进程在“狂转”。
+
+#### 2) BSD 层：提供 Unix 的“外表”
+
+主要来自 FreeBSD，建在 Mach 之上：
+
+- **进程模型**：BSD 的 proc 结构包装 Mach 的 task，提供 PID、fork/exec、信号、用户/组权限；
+- **POSIX 系统调用**：open、read、write、socket 等；
+- **VFS 文件系统层**：APFS、HFS+、exFAT、NFS 等；
+- **网络协议栈**：TCP/IP、套接字、防火墙；
+- **安全框架**：来自 TrustedBSD 的 MAC 框架。Sandbox（沙盒）、AMFI 等都是它的策略模块。
+
+所以 macOS 是**通过了 UNIX 03 认证的正宗 Unix**，而 Linux 只是“类 Unix”。
+
+#### 3) IOKit：驱动框架
+
+- 用 **C++ 的受限子集**（没有异常、没有多重继承、没有 RTTI）写驱动；
+- 驱动是**面向对象**的，一个驱动继承 `IOService` 等基类；
+- **驱动匹配（matching）**：内核发现一个硬件后，会按 Info.plist 里的条件和 `IOProbeScore` 分数找出最合适的驱动。
+  - 前面讲到的 `ASPP-Override.kext`，就是通过提高 `IOProbeScore` 抢到 CPU 电源管理驱动的匹配权；
+- **IORegistry**：内核里的设备对象树。本次排查用的 `ioreg -rn AppleSmartBattery` 就是在读它；
+- 驱动的打包形式叫 **kext**（Kernel Extension，内核扩展），例如 `SimpleMSR.kext`、`Lilu.kext`。
+
+#### 4) libkern 和 Platform Expert
+
+- **libkern**：内核里的 C++ 运行时、原子操作、OSObject 基础类等；
+- **Platform Expert**：把具体硬件平台（Intel Mac、Apple Silicon、虚拟机）的差异抽象掉。
+
+#### 为什么叫“混合内核”？
+
+纯微内核（如 Mach 3.0 本身）把文件系统、驱动都放在用户态，通过 IPC 通信，很安全但很慢。XNU 把 Mach、BSD、IOKit **都放在同一个内核地址空间里**，互相之间直接函数调用，性能接近宏内核；同时又保留了 Mach 的 IPC 模型和设计。
+
+### E.3 XNU 与 Linux 内核的对比
+
+| 对比项 | macOS（XNU） | Linux |
+|---|---|---|
+| **内核类型** | 混合内核（Mach + BSD + IOKit，同一地址空间） | 宏内核（单体内核）+ 可加载模块 |
+| **起源** | NeXTSTEP → Mach 3.0 + FreeBSD，1989 年起 | Linus Torvalds 1991 年从零编写 |
+| **开源情况** | XNU 以 APSL 协议开源，但 macOS 整体大部分闭源 | 内核完全开源（GPLv2），发行版大都开源 |
+| **Unix 认证** | ✅ UNIX 03 认证 | ❌ 类 Unix（未认证） |
+| **驱动形式** | kext（C++ IOKit）；新方向是 **DriverKit 系统扩展**（驱动跑在用户态） | `.ko` 内核模块（C），`insmod` / `modprobe` 加载 |
+| **驱动发现** | IOKit 匹配 + IORegistry | udev + sysfs + 设备树 / ACPI |
+| **进程间通信** | Mach 消息 / 端口、XPC（主力），也支持管道、Unix 套接字 | 管道、Unix 套接字、D-Bus、共享内存；Android 用 Binder |
+| **可执行文件格式** | **Mach-O**（支持多架构“通用二进制”） | **ELF** |
+| **动态链接器** | `dyld`，外加 **dyld 共享缓存**（系统库预先链接好，打成一个大文件） | `ld-linux.so` |
+| **C 标准库** | `libSystem`（包含 libc、libm、pthread 等），不允许静态链接 | glibc / musl，可以静态链接 |
+| **系统调用** | **不公开稳定的 ABI**，必须通过 libSystem 调用；分 BSD 调用和 Mach trap 两类 | 系统调用 ABI **稳定公开**，可以直接 `syscall` |
+| **PID 1（init）** | `launchd`：同时负责 init、cron、inetd、服务管理 | `systemd`（主流）/ SysVinit / OpenRC 等 |
+| **服务配置** | `/System/Library/LaunchDaemons/*.plist` | `/etc/systemd/system/*.service` |
+| **文件系统** | **APFS**：写时复制、快照、加密、系统卷密封 | ext4 / XFS / Btrfs（Btrfs 也有快照） |
+| **系统盘保护** | 签名系统卷（SSV），根目录只读并带加密签名 | 一般可读写；少数发行版有不可变系统（如 Fedora Silverblue） |
+| **安全机制** | SIP、AMFI（强制代码签名）、Sandbox、Gatekeeper、TCC（隐私授权） | SELinux / AppArmor、seccomp、namespaces、capabilities |
+| **容器支持** | 内核没有 namespaces / cgroups，Docker 要跑在 Linux 虚拟机里 | 原生 namespaces + cgroups，容器的发源地 |
+| **调度器** | Mach 调度器 + Clutch（按线程组分层调度）+ QoS 等级 | CFS → EEVDF（6.6 起） |
+| **CPU 调频** | XCPM（`sysctl machdep.xcpm`），由内核和 SMC 协同 | cpufreq + intel_pstate / amd-pstate，调速器（governor）可选 |
+| **查看内核参数** | `sysctl`、`ioreg`（**没有 /proc 和 /sys**） | `/proc`、`/sys`、`sysctl` |
+| **内核日志** | 统一日志系统：`log show` / `log stream` | `dmesg` / `journalctl -k` |
+| **列出驱动** | `kmutil showloaded`（旧：`kextstat`） | `lsmod` |
+| **引导程序** | Intel：Apple EFI 固件 + `boot.efi`；Apple Silicon：iBoot | GRUB / systemd-boot / 直接 EFI stub |
+| **早期启动环境** | **没有 initramfs**，内核直接挂载真正的根卷 | initramfs（常用 BusyBox 或 dracut / systemd） |
+| **命令行工具** | BSD 版本（`sed`、`ps`、`date` 等参数和 GNU 不同） | GNU coreutils |
+
+> 💡 **一个实际例子**：前面修改文档时，我用的是 `sed -i '' 's/.../.../' 文件`。macOS 自带的是 BSD 版 `sed`，`-i` 后面**必须**跟一个备份后缀（空字符串 `''` 表示不备份）。在 Linux 的 GNU sed 上，同样的写法会出错。这就是 BSD 工具和 GNU 工具的差异。
+
+### E.4 Linux 是怎么启动的（作为对比）
+
+```
+① 固件：BIOS 或 UEFI
+    ▼
+② 引导程序：GRUB / systemd-boot
+    │  读取配置，加载 vmlinuz（压缩内核）和 initramfs（初始内存盘）
+    ▼
+③ 内核启动：解压、初始化内存/CPU/中断，内置驱动初始化
+    ▼
+④ 运行 initramfs 里的 /init
+    │  initramfs 是一个临时的迷你根文件系统，里面经常用 BusyBox
+    │  （BusyBox 把 sh、ls、mount、modprobe 等几百个命令打包成一个小程序）
+    │  任务：加载磁盘/RAID/LVM/加密驱动，找到并挂载真正的根分区
+    ▼
+⑤ switch_root：切换到真正的根文件系统
+    ▼
+⑥ 启动 /sbin/init（通常是 systemd），成为 PID 1
+    ▼
+⑦ systemd 按依赖关系启动各种服务（target / unit）
+    ▼
+⑧ 登录管理器（GDM / SDDM）或文本登录（getty）→ 桌面 / shell
+```
+
+**为什么 Linux 需要 initramfs + BusyBox？** 因为 Linux 要支持的硬件和存储组合（各种 RAID、LVM、LUKS 加密、网络根文件系统）太多，不可能把所有驱动都编进内核。所以先用一个临时的小系统，按需加载驱动，找到真正的根分区。BusyBox 体积小、功能全，非常适合做这个临时系统，也广泛用于路由器等嵌入式设备。
+
+### E.5 macOS 是怎么启动的（Intel Mac，以本机为例）
+
+```
+① 按下电源 → CPU 从固件 ROM 开始执行
+    │  Apple EFI 固件：硬件自检、初始化内存/显卡/存储控制器
+    │  读取 NVRAM：启动盘（efi-boot-device）、boot-args、csr-active-config 等
+    ▼
+②【本机特有】OpenCore（EFI 分区 /EFI/BOOT/BOOTx64.efi）
+    │  放宽 SIP、写启动参数、准备好 kext 注入和内核补丁（详见附录 D）
+    │  原厂 Mac 没有这一步，固件会直接找 boot.efi
+    ▼
+③ boot.efi（Apple 的引导程序，相当于 Linux 的 GRUB）
+    │  位于 Preboot 卷和 /System/Library/CoreServices/boot.efi
+    │  ├─ 显示苹果 Logo 和进度条（按 Cmd+V 或加 -v 参数会改成滚动的文字日志）
+    │  ├─ FileVault 开启时：显示解锁界面，解密数据卷
+    │  ├─ 从 Preboot 卷加载 Boot Kernel Collection（内核 + 启动必需的 kext）
+    │  └─ 把设备树、启动参数、内存布局等信息交给内核
+    ▼
+④ XNU 内核初始化
+    │  ├─ Mach 层：虚拟内存、调度器、IPC、第一个线程
+    │  ├─ IOKit：建立 IORegistry，开始驱动匹配
+    │  │   （显卡、存储、USB、SMC、电池……一层层匹配上驱动）
+    │  ├─ BSD 层：bsd_init()，初始化进程表、VFS、网络
+    │  └─ 挂载根文件系统：直接挂载 APFS 系统卷的只读快照
+    │     （不需要 initramfs：Mac 硬件型号少，存储驱动都在 Boot KC 里）
+    ▼
+⑤ 启动 /sbin/launchd，成为 PID 1（相当于 Linux 的 systemd）
+    │  ├─ 挂载其余卷：Data、Preboot、VM、Update（firmlinks 把 System 和 Data 合并成一个目录树）
+    │  ├─ 读取 /System/Library/LaunchDaemons/*.plist（本机有 412 个系统守护进程配置）
+    │  └─ 按需启动：logd（日志）、configd（网络配置）、powerd（电源）、
+    │     WindowServer（图形）、kernelmanagerd（kext 管理）…
+    │     很多服务是“按需启动”的：有人通过 Mach 端口连接它时才启动
+    ▼
+⑥ WindowServer 启动图形界面 → loginwindow 显示登录界面
+    ▼
+⑦ 用户登录 → 用户级 launchd 读取 LaunchAgents（本机系统级有 435 个）
+    │  启动 Dock、Finder、SystemUIServer、菜单栏、登录项 …
+    ▼
+⑧ 桌面就绪
+```
+
+#### 本机的启动相关文件和卷
+
+```bash
+❯ ps -p 1 -o pid,comm
+  PID COMM
+    1 /sbin/launchd                 ← PID 1
+
+❯ ls -la /System/Library/KernelCollections/
+BootKernelExtensions.kc     66 MB   ← 启动内核集合：内核 + 启动必需的 kext
+SystemKernelExtensions.kc  373 MB   ← 系统内核集合：其余的 Apple kext，启动后按需加载
+
+❯ mount | head -6
+/dev/disk1s4s1 on / (apfs, sealed, local, read-only, journaled)   ← 系统卷快照（只读）
+/dev/disk1s2 on /System/Volumes/Preboot (apfs, ...)                ← 引导文件、内核缓存
+/dev/disk1s6 on /System/Volumes/VM (apfs, noexec, ...)             ← 交换文件、睡眠镜像
+/dev/disk1s5 on /System/Volumes/Update (apfs, ...)                 ← 系统更新 / OCLP 打补丁时用
+/dev/disk1s1 on /System/Volumes/Data (apfs, ..., root data)        ← 用户数据（可读写）
+```
+
+APFS 容器 `disk1` 里的各个卷：
+
+| 卷 | 角色 | 作用 |
+|---|---|---|
+| `disk1s4`（mac） | System | 系统卷，只读；`disk1s4s1` 是它当前启动用的快照 |
+| `disk1s1`（mac - Data） | Data | 用户数据、应用、`/Library`、`/Users` |
+| `disk1s2` | Preboot | boot.efi、内核集合、FileVault 解锁界面资源 |
+| `disk1s3` | Recovery | 恢复模式（一个迷你 macOS） |
+| `disk1s6` | VM | 交换文件、休眠镜像（`/var/vm/sleepimage`） |
+| `disk1s5` | Update | 系统更新时的临时工作区 |
+
+另外还有 `disk0s1`（EFI 分区，本机放 OpenCore），以及 Windows 的 `BOOTCAMP` 分区（NTFS）。
+
+#### 三种内核集合（Kernel Collection）
+
+从 macOS 11 起，Apple 把内核和 kext 预先链接成“内核集合”：
+
+| 内核集合 | 内容 | 类比 Linux |
+|---|---|---|
+| **Boot KC**（BootKernelExtensions.kc） | 内核本体 + 启动必需的 kext | vmlinuz + 内置驱动 |
+| **System KC**（SystemKernelExtensions.kc） | 其余 Apple kext | `/lib/modules/` 下的模块 |
+| **Auxiliary KC** | 第三方 kext（`/Library/Extensions`），需要在“隐私与安全性”里批准 | 第三方的 DKMS 模块 |
+
+OCLP 打根卷补丁时运行 `kmutil install ... --update-all`，就是在**重新生成这些内核集合**。OpenCore 注入 kext，则是在启动时往 Boot KC 里“塞”东西。
+
+### E.6 macOS 有没有 BusyBox？
+
+**没有，也不需要。** 原因如下：
+
+1. **没有 initramfs 阶段**：Mac 硬件型号有限，存储驱动都预先放进了 Boot KC，内核可以直接挂载真正的根卷，不需要临时小系统。
+2. **命令行工具是完整的 BSD 工具集**：`/bin`、`/usr/bin` 下的 `ls`、`sed`、`ps` 等都是独立的程序，大多来自 FreeBSD，不是 BusyBox 那种“一个程序扮演所有命令”。
+
+macOS 中**功能上接近“迷你系统”**的东西有这些：
+
+| 环境 | 进入方法 | 说明 |
+|---|---|---|
+| **恢复模式（Recovery）** | 开机按 `Cmd + R`（OpenCore 菜单里也有恢复项） | 从 Recovery 卷启动一个精简版 macOS，里面有终端、磁盘工具、重装系统、`csrutil` 等。**这是 macOS 里最接近 Linux initramfs / 救援盘的东西** |
+| **单用户模式** | 以前开机按 `Cmd + S` | 直接进入 root shell，类似 Linux 的 `init=/bin/sh`。从签名系统卷时代（macOS 11）开始，Intel Mac 上基本已不可用，Apple Silicon 没有 |
+| **啰嗦模式（Verbose）** | 开机按 `Cmd + V`，或在 boot-args 里加 `-v` | 不显示苹果 Logo，改为滚动显示内核和启动日志，类似 Linux 启动时的文字输出。**排查启动问题很有用**：OCLP 用户可以在 OpenCore 设置里加 `-v` |
+| **OpenShell.efi** | OpenCore 启动菜单里的 UEFI Shell | 固件层面的命令行，可以查看磁盘、执行 EFI 程序，类似 GRUB 的命令行 |
+| **安全模式** | 开机按住 `Shift` | 只加载必需的 kext，禁用登录项、清理缓存，类似 Linux 的“恢复模式启动” |
+
+> 如果真的想在 macOS 上用 GNU 工具，可以用 Homebrew 安装 `coreutils`、`gnu-sed` 等，命令名前会带 `g` 前缀（如 `gsed`、`gls`）。
+
+### E.7 Apple Silicon Mac 的启动（补充）
+
+本机是 Intel Mac。Apple Silicon（M1 及以后）的启动流程完全不同：
+
+```
+Boot ROM（芯片内固化的 SecureROM）
+  → LLB / iBoot（Apple 自研引导程序，取代了 UEFI + boot.efi）
+  → 验证签名后加载内核集合
+  → XNU → launchd …
+```
+
+- 没有 UEFI，也没有 EFI 分区，**所以不能用 OpenCore，也不需要 OCLP**；
+- 每个系统卷都有自己的“启动安全策略”（完全安全 / 降低安全性），加载第三方 kext 需要在恢复模式里手动降低安全级别；
+- 从 `ls /System/Library/Kernels/` 能看到 `kernel.release.t8103`（M1）、`t6000`（M1 Pro/Max）等内核文件，这是同一个 macOS 安装包为不同芯片准备的内核，本机 Intel 用的是 `kernel`。
+
+### E.8 回到本次问题：同一件事在两个系统里怎么做
+
+以本次的 CPU 降频问题为例，对比一下两个系统的做法：
+
+| 任务 | macOS | Linux |
+|---|---|---|
+| 查看 CPU 频率上限 | `sysctl machdep.xcpm.hard_plimit_max_100mhz_ratio` | `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq` |
+| 查看是否被 PROCHOT 降频 | `pmset -g therm` | `cat /sys/devices/system/cpu/cpu0/thermal_throttle/*`，或 `turbostat` |
+| 查看温度和风扇 | `sudo powermetrics --samplers smc` | `sensors`（lm-sensors） |
+| 查看电池 | `ioreg -rn AppleSmartBattery` / `system_profiler SPPowerDataType` | `upower -i /org/freedesktop/UPower/devices/battery_BAT0` |
+| 关闭 BD PROCHOT | 加载 **SimpleMSR.kext**（通过 OpenCore 注入） | `sudo modprobe msr` 后执行 `sudo wrmsr 0x1FC <清除第 0 位后的值>`（msr-tools） |
+| 查看已加载的驱动 | `kmutil showloaded` | `lsmod` |
+| 睡眠 / 唤醒日志 | `pmset -g log` | `journalctl -b \| grep -i suspend` |
+| 电源设置 | `pmset` | systemd-logind 配置、TLP、powertop |
+
+两个系统的底层原理一样：都是往 CPU 的 **MSR 0x1FC（MSR_POWER_CTL）寄存器**写值，清掉第 0 位（BD PROCHOT 使能位）。区别只在工具：Linux 可以直接用命令写寄存器，而 macOS 必须通过内核扩展（kext）来写。
 
 ---
 
