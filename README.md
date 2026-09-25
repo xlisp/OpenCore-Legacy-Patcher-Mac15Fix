@@ -19,6 +19,7 @@
 7. [附录 A：老 Mac 用 OCLP 升级到 macOS 15 的方法](#附录-a老-mac-用-oclp-升级到-macos-15-的方法)
 8. [附录 B：动态壁纸导致 CPU 高占用](#附录-b动态壁纸导致-cpu-高占用)
 9. [附录 C：常见问题 FAQ](#附录-c常见问题-faq)
+10. [附录 D：OCLP 让老 Mac 运行新系统的原理与启动机制](#附录-doclp-让老-mac-运行新系统的原理与启动机制)
 
 ---
 
@@ -457,6 +458,282 @@ A：两者本质相同，都是把 SMC/EC 里卡住的降频状态清掉。SMC �
 A：
 - macOS 小版本更新：SimpleMSR 在 EFI 分区里，**不受影响**；
 - OCLP 升级后重新构建 OpenCore：**要确认 Disable Firmware Throttling 仍然勾选**，否则 SimpleMSR 不会被打包进去。
+
+---
+
+## 附录 D：OCLP 让老 Mac 运行新系统的原理与启动机制
+
+### D.1 一句话概括
+
+**OCLP 不改固件，也不改硬件。** 它做两件事：
+
+1. **启动时**：用 OpenCore 引导器在**内存里**“骗过”和“修补”macOS。它会绕过机型检查、注入驱动、修补内核。这部分全都放在 EFI 分区里。
+2. **装好系统后**：用根卷补丁（Root Patch）把 Apple 已经删掉的老硬件驱动**补回系统卷**。
+
+这两部分都可以撤销。删掉 EFI 分区里的 OpenCore，并还原系统快照，Mac 就回到原厂状态。
+
+### D.2 Apple 是怎么“拦住”老 Mac 的？
+
+要理解 OCLP，先要知道 Apple 设了哪几道关卡：
+
+| 关卡 | Apple 的做法 | 后果 |
+|---|---|---|
+| ① 机型白名单 | 安装器和 `boot.efi` 会检查主板 ID（board-id）和机型标识，不在支持列表里就拒绝安装或启动 | 安装器提示“此 Mac 不支持”，或者启动直接失败 |
+| ② 软件更新过滤 | 系统更新服务器按机型下发更新 | 在“系统设置”里看不到新系统 |
+| ③ 驱动被删除 | 新系统删掉了老显卡（非 Metal 或旧 Metal）、老 Wi-Fi/蓝牙芯片、老摄像头等的驱动 | 就算能启动，也没有显卡加速、没有 Wi-Fi |
+| ④ 系统卷签名保护 | 从 Big Sur 开始，系统卷是只读、带加密签名的快照（SSV，签名系统卷）。改了任何文件，签名校验就会失败 | 无法直接往系统里补驱动 |
+| ⑤ 安全机制 | SIP（系统完整性保护）、AMFI（Apple 移动文件完整性，负责代码签名强制）、库验证 | 未经 Apple 签名的驱动和补丁无法加载 |
+| ⑥ CPU 指令集 | 新系统的部分组件要求 AVX2 等新指令 | 太老的 CPU 运行时会崩溃（Haswell 支持 AVX2，这台机器不受影响） |
+
+OCLP 就是逐一对付这些关卡的工具集合。
+
+### D.3 启动链：从按下电源到进入桌面
+
+```
+① 按下电源键
+    │
+    ▼
+② Mac 固件（Apple UEFI）上电自检
+    │  固件去 EFI 分区找启动程序：/EFI/BOOT/BOOTx64.efi
+    │  （这是 OpenCore，不是 Apple 原生的启动程序）
+    ▼
+③ OpenCore.efi 启动
+    │  ├─ 读取 /EFI/OC/config.plist（OCLP 根据你的机型自动生成）
+    │  ├─ 加载 UEFI 驱动（OpenRuntime.efi 等）
+    │  ├─ 修补 ACPI 表（例如 XHC1→SHC1 等重命名）
+    │  ├─ 写入 NVRAM：boot-args、csr-active-config（放宽 SIP）等
+    │  └─ 设置 SMBIOS（机型信息），必要时伪装机型
+    ▼
+④ OpenCore 启动菜单（OpenCanopy 图形界面）
+    │  选择 macOS / Windows / 恢复模式
+    ▼
+⑤ OpenCore 加载 Apple 原版 boot.efi，并在内存里给它打补丁
+    │  └─ “Skip Board ID check”：跳过 boot.efi 的机型白名单检查
+    ▼
+⑥ boot.efi 从 Preboot 卷加载内核（XNU）和内核集合（Boot Kernel Collection）
+    │  OpenCore 在这一步拦截文件读取：
+    │  ├─ Kernel → Add：把第三方 kext 注入内核集合（Lilu、SimpleMSR 等）
+    │  ├─ Kernel → Patch：在内存里修改内核或 Apple kext 的二进制代码
+    │  └─ Kernel → Block：阻止某些不兼容的 Apple kext 加载
+    ▼
+⑦ XNU 内核启动
+    │  Lilu 及其插件（RestrictEvents、FeatureUnlock、CPUFriend 等）
+    │  在运行时继续修补内核和系统进程
+    ▼
+⑧ 挂载系统卷快照
+    │  已打过根卷补丁的快照（补回了老显卡、Wi-Fi 等驱动）
+    ▼
+⑨ 登录界面 → 桌面
+```
+
+**要点：**
+
+- **所有启动期补丁都只在内存里生效**，硬盘上的 Apple 文件（boot.efi、内核）并没有被修改。
+- OpenCore 放在 EFI 分区的 `/EFI/OC/` 目录下。用 `sudo diskutil mount disk0s1` 挂载后就能看到。
+- 开机按住 **Option** 会进入 **Apple 原生的启动菜单**。在这里选 “EFI Boot” 才会走 OpenCore；直接选 Windows 会绕过 OpenCore。
+- OCLP 的 **Build and Install OpenCore** 做的事情，就是根据你的机型生成 `config.plist`，挑出需要的 kext 和驱动，然后一起拷进 EFI 分区。
+
+### D.4 第一层：OpenCore 启动期补丁（EFI 分区）
+
+OCLP 源码的 `opencore_legacy_patcher/efi_builder/` 目录，负责按机型生成 OpenCore 配置：
+
+| 源码文件 | 负责内容 |
+|---|---|
+| `build.py` | 总流程：复制基础配置，调用下面各模块，保存 config.plist |
+| `smbios.py` | 机型信息：跳过 Board ID 检查，或者伪装成受支持的机型 |
+| `firmware.py` | CPU 与固件：电源管理、**SimpleMSR（本次修复用的）**、CPU 指令集兼容 |
+| `graphics_audio.py` | 显卡和声卡的启动期设置 |
+| `networking/` | Wi-Fi 和网卡的 kext 注入 |
+| `bluetooth.py` | 蓝牙补丁 |
+| `storage.py` | 硬盘控制器（SATA、NVMe、RAID） |
+| `security.py` | SIP 放宽、AMFI 相关补丁、安全启动模型 |
+| `misc.py` | 其他：USB 映射、键盘和触控板、RestrictEvents、FeatureUnlock 等 |
+
+#### 1) 绕过机型检查（对付关卡 ①②）
+
+OCLP 基础配置（`payloads/Config/config.plist`）里有这些关键补丁：
+
+- **`Skip Board ID check`**：Booter 补丁，在内存里修改 `boot.efi`，跳过主板 ID 白名单检查。
+  - 对应 `smbios.py` 中的代码：`"- Enabling Board ID exemption patch"`（注释写明：credit to Parrotgeek1 for boot.efi and hv_vmm_present patch sets）
+- **`Reroute HW_BID to OC_BID`**：让系统读取 OpenCore 提供的 board-id。
+- **`Reroute kern.hv_vmm_present`**：让 macOS 以为自己**运行在虚拟机里**。
+  - Apple 对虚拟机不做机型限制，所以系统更新服务会正常推送新系统和更新。这就是用了 OCLP 后，能直接在“系统设置 → 软件更新”里收到更新的原因。
+  - 也可以改用 RestrictEvents 的 `sbvmm` 参数，只对软件更新进程伪装成虚拟机（见 `misc.py`）。
+- **`-no_compat_check`**：启动参数，跳过内核的兼容性检查（手动伪装成当前机型时会加上）。
+- **SMBIOS 伪装（可选）**：`smbios.py` 可以把机型伪装成受支持的型号（Minimal / Moderate / Advanced 三档）。新版 OCLP 在大多数机型上默认**不伪装**，只做 Board ID 豁免，以减少副作用。
+
+#### 2) 注入驱动 kext（对付关卡 ③ 的一部分）
+
+有些驱动只要在启动时塞进内核就能工作，不需要改系统卷：
+
+| kext | 作用 |
+|---|---|
+| **Lilu** | 内核补丁框架，很多插件都依赖它 |
+| **WhateverGreen** | 显卡相关的内核修补 |
+| **RestrictEvents** | 阻止或修改某些系统进程，并提供 `sbvmm` 等功能 |
+| **FeatureUnlock** | 解锁隔空播放到 Mac、随航、通用控制等被机型限制的功能 |
+| **CryptexFixup** | 在不支持 AVX2 的 CPU 上安装兼容版本的 dyld 共享缓存 |
+| **AMFIPass** | 让系统在 AMFI 放宽的情况下仍能正常运行 |
+| **SimpleMSR** | 清除 BD PROCHOT 降频位（本次修复用的） |
+| **ASPP-Override** | 调整 CPU 电源管理插件的匹配 |
+| **IO80211FamilyLegacy / IOSkywalkFamily** | 老 Broadcom Wi-Fi 的驱动栈 |
+| **USB Map** | USB 端口映射 |
+
+#### 3) 内核和 kext 二进制补丁
+
+`config.plist` 里的 Kernel → Patch 会在内存里直接修改 Apple 代码，例如：
+
+- `Patch AppleSMC`：配合 SMC 伪装；
+- `Disable Library Validation Enforcement`：放宽库验证；
+- `Disable Root Hash validation`：不校验系统卷的哈希，**这是根卷补丁能生效的前提**；
+- `Force FileVault on Broken Seal`：系统卷签名被破坏后，仍然允许使用 FileVault；
+- `Allow AppleKeyStore Downgrade` 等：兼容旧版组件。
+
+#### 4) 放宽安全策略（对付关卡 ⑤）
+
+本机实测：
+
+```bash
+❯ nvram csr-active-config
+csr-active-config	%03%08%00%00          # 即 0x803
+
+❯ csrutil status
+System Integrity Protection status: unknown (Custom Configuration).
+	Kext Signing: disabled               ← 允许加载非 Apple 签名的 kext
+	Filesystem Protections: disabled     ← 允许根卷补丁修改系统文件
+	Debugging Restrictions: enabled
+	NVRAM Protections: enabled
+	...
+
+❯ nvram boot-args
+boot-args	keepsyms=1 debug=0x100 -lilubetaall ipc_control_port_options=0 -nokcmismatchpanic
+```
+
+| 启动参数 | 含义 |
+|---|---|
+| `keepsyms=1 debug=0x100` | 内核崩溃时保留符号、不自动重启，方便排查 |
+| `-lilubetaall` | 允许 Lilu 及其插件在未经测试的新系统版本上运行 |
+| `ipc_control_port_options=0` | 放宽 IPC 端口限制，避免部分补丁后的进程崩溃 |
+| `-nokcmismatchpanic` | 内核集合与内核版本不匹配时不崩溃 |
+
+SIP 只是**部分**关闭，调试限制、NVRAM 保护等仍然开着。这是 OCLP 为了兼顾安全和功能做的最小放宽。
+
+### D.5 第二层：根卷补丁（Root Patch，系统卷）
+
+#### 为什么需要它？
+
+有些驱动**不只是一个 kext**，还包括用户空间的框架、着色器编译器、Metal 库等，例如显卡驱动。它们必须实际放进 `/System/Library/` 才能工作，没办法只靠启动时注入。
+
+但 macOS 的系统卷是**只读、带签名的 APFS 快照**，所以 OCLP 的流程是这样的（见 `sys_patch/sys_patch.py` 顶部注释）：
+
+```
+1. 挂载真正的系统卷（不是只读快照），挂载到 /System/Volumes/Update/mnt1
+2. 把老驱动、框架复制或合并进去（Overwrite / Merge System Volume）
+3. 重建内核缓存：
+   sudo kmutil install --volume-root /System/Volumes/Update/mnt1/ --update-all
+4. 必要时重建 dyld 共享缓存、更新 Preboot 卷里的内核缓存
+5. 创建新的 APFS 快照，并设为启动快照：
+   sudo bless --folder /System/Volumes/Update/mnt1/System/Library/CoreServices --bootefi --create-snapshot
+```
+
+回滚也很简单，把启动快照切回 Apple 原版密封的那个即可：
+
+```bash
+sudo bless --mount /System/Volumes/Update/mnt1 --bootefi --last-sealed-snapshot
+```
+
+OCLP 界面里的 **Revert Root Patches** 做的就是这件事。
+
+#### 根卷补丁按硬件分类
+
+源码目录 `sys_patch/patchsets/hardware/`：
+
+- `graphics/`：`intel_haswell.py`（本机用这个）、`intel_ivy_bridge.py`、`nvidia_kepler.py`、`amd_polaris.py` 等，每一代显卡一个文件；
+- `networking/`：`modern_wireless.py`、`legacy_wireless.py`；
+- `misc/`：`pcie_webcam.py`（摄像头）、`display_backlight.py`、`keyboard_backlight.py`、`usb11.py`、`t1_security.py` 等。
+
+`sys_patch/patchsets/detect.py` 会先检测硬件，决定要打哪些补丁。
+
+#### 本机实际打过的补丁
+
+补丁记录保存在 `/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist`，查看方法：
+
+```bash
+plutil -p /System/Library/CoreServices/OpenCore-Legacy-Patcher.plist | grep -E '^\s{2}"'
+```
+
+本机结果：
+
+| 补丁集 | 作用 |
+|---|---|
+| **Intel Haswell** | Iris Pro 5200 核显驱动 |
+| **Metal 3802 Common / Extended / .metallibs** | 旧版 Metal 3802 图形栈。Haswell 不支持新版 Metal，需要换回旧版 Metal 框架和编译器 |
+| **Monterey GVA** | 从 macOS 12 移植过来的视频硬件解码框架 |
+| **Monterey OpenCL** | 从 macOS 12 移植过来的 OpenCL |
+| **Modern Wireless Common** | Wi-Fi（BCM94360 系列）支持 |
+| **PCIe FaceTime Camera** | PCIe 接口的 FaceTime 摄像头 |
+
+补丁信息：OCLP v2.5.1，PatcherSupportPkg v1.9.7，打补丁时间 2026-09-20，系统 24.6 (24H23)，Metal 库来自 `MetallibSupportPkg/15.7.9-24G830`。
+
+> 这也解释了附录 B 的动态壁纸问题：显卡用的是旧版 Metal 3802，视频解码框架是从 Monterey 移植的，**并不是为 macOS 15 的新壁纸渲染管线设计的**，所以动态壁纸的渲染和解码效率很差，最终落到 CPU 上。
+
+#### 为什么 macOS 每次更新后都要重打补丁？
+
+macOS 更新会**用 Apple 的新快照整个替换系统卷**，之前补进去的驱动就没了。所以 OCLP 会装一个后台服务（`sys_patch/auto_patcher/`），检测到系统更新后弹窗提示重新打根卷补丁。
+
+**如果更新后显卡卡顿、Wi-Fi 消失，基本就是根卷补丁没了，重打一次即可。**
+
+### D.6 两层的分工与对比
+
+| 对比项 | OpenCore 启动期补丁 | 根卷补丁 |
+|---|---|---|
+| 存放位置 | EFI 分区 `/EFI/OC/` | 系统卷 `/System/Library/` |
+| 生效方式 | 每次开机时在内存里修补 | 写入磁盘，并创建新的系统快照 |
+| 解决什么 | 机型检查、内核补丁、kext 注入、SIP 放宽、CPU 电源管理 | 显卡加速、Metal、视频解码、Wi-Fi、摄像头等需要完整框架的驱动 |
+| macOS 更新后 | **不受影响** | **会被冲掉，需要重打** |
+| OCLP 升级后 | 需要重新 Build and Install OpenCore | 一般会提示重打 |
+| 撤销方法 | 删除或还原 EFI 分区里的 OpenCore | Revert Root Patches（切回原版快照） |
+| 本次 SimpleMSR 修复 | ✅ 在这一层 | — |
+
+### D.7 为什么这个方案是安全、可逆的？
+
+- **不刷固件**：Mac 的 BootROM 或固件没有被修改，Apple 原生启动菜单始终能用。
+- **启动期补丁都在内存里**：Apple 的 `boot.efi` 和内核文件原封不动。
+- **系统卷快照可回滚**：Apple 原版的密封快照一直保留（Monterey 起更可靠）。
+- **SIP 只部分放宽**：调试限制、NVRAM 保护等仍然开着。
+
+代价是：
+
+- 放宽了 SIP 和 AMFI，整体安全性比原厂低；
+- 系统卷签名被破坏，部分依赖系统完整性的功能可能受限；
+- 依赖 OCLP 社区跟进新系统，大版本更新前要先等 OCLP 适配。
+
+### D.8 相关查看命令
+
+```bash
+# OpenCore / OCLP 状态
+nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version   # OpenCore 版本
+nvram boot-args                                              # 启动参数
+nvram csr-active-config                                      # SIP 配置值
+csrutil status                                               # SIP 各项状态
+kmutil showloaded | grep -v com.apple                        # 已加载的第三方 kext
+
+# 根卷补丁记录
+plutil -p /System/Library/CoreServices/OpenCore-Legacy-Patcher.plist
+
+# 系统快照
+diskutil apfs listSnapshots /                                # 当前系统卷快照
+
+# 查看 EFI 分区里的 OpenCore
+diskutil list                                                # 找到 EFI 分区（一般是 disk0s1）
+sudo diskutil mount disk0s1
+ls /Volumes/EFI/EFI/OC/Kexts                                 # 查看注入的 kext（应能看到 SimpleMSR.kext）
+sudo diskutil unmount disk0s1                                # 看完记得卸载
+
+# OCLP 保存的用户设置
+defaults read /Users/Shared/.com.dortania.opencore-legacy-patcher.plist
+# 本机可以看到 "GUI:disable_fw_throttle" = 1，即本次开启的降频屏蔽
+```
 
 ---
 
