@@ -21,6 +21,7 @@
 9. [附录 C：常见问题 FAQ](#附录-c常见问题-faq)
 10. [附录 D：OCLP 让老 Mac 运行新系统的原理与启动机制](#附录-doclp-让老-mac-运行新系统的原理与启动机制)
 11. [附录 E：macOS 内核（XNU）原理、启动过程及与 Linux 的对比](#附录-emacos-内核xnu原理启动过程及与-linux-的对比)
+12. [附录 F：OCLP 与台式机装黑苹果（Hackintosh）的区别](#附录-foclp-与台式机装黑苹果hackintosh的区别)
 
 ---
 
@@ -1020,6 +1021,196 @@ Boot ROM（芯片内固化的 SecureROM）
 | 电源设置 | `pmset` | systemd-logind 配置、TLP、powertop |
 
 两个系统的底层原理一样：都是往 CPU 的 **MSR 0x1FC（MSR_POWER_CTL）寄存器**写值，清掉第 0 位（BD PROCHOT 使能位）。区别只在工具：Linux 可以直接用命令写寄存器，而 macOS 必须通过内核扩展（kext）来写。
+
+---
+
+## 附录 F：OCLP 与台式机装黑苹果（Hackintosh）的区别
+
+### F.1 一句话概括
+
+**同一个引导器，两个相反的方向。**
+
+- **黑苹果**：硬件是假的（普通 PC），系统是真的。要让 macOS **误以为**这台 PC 是 Mac。
+- **OCLP**：硬件是真的（Apple 原厂 Mac），只是被新系统在软件上淘汰了。要让 macOS **别再嫌弃**这台老 Mac。
+
+所以问题里的两个词答案都是**是的**：
+
+| 问 | 答 |
+|---|---|
+| 也有补丁驱动吗？ | 有。两边都靠 kext 注入 + 内核二进制补丁，很多 kext 是同一批（Lilu、WhateverGreen、RestrictEvents…） |
+| 也有引导欺骗吗？ | 有，但**骗的内容不同**：黑苹果骗“我是一台 Mac”；OCLP 骗“我是一台**还被支持的** Mac”（或者干脆骗“我运行在虚拟机里”） |
+
+两者用的是**同一个 OpenCore 引导器**（acidanthera 出品），同一份 `config.plist` 结构，同一套 EFI 分区布局。OCLP 本质上就是**一个按 Mac 机型自动生成 OpenCore 配置的工具**，外加一套黑苹果没有的“根卷补丁”。
+
+### F.2 两边各自要过的关卡
+
+附录 D.2 列了 Apple 拦住老 Mac 的六道关卡。把黑苹果放在一起对比：
+
+| 关卡 | 黑苹果（PC） | OCLP（老 Mac） |
+|---|---|---|
+| 没有 SMC 芯片 | **必须**用 VirtualSMC/FakeSMC 模拟，否则内核直接起不来 | 不需要，机器上有真的 SMC 芯片 |
+| 机型信息 | **必须**伪造 SMBIOS（装成 `iMac19,1`、`MacPro7,1` 等） | 默认**不伪造**，只做 Board ID 豁免 |
+| 机型白名单 | 伪造成受支持机型后自然通过 | Skip Board ID check + `-no_compat_check` |
+| 软件更新 | 伪造机型后正常收到 | `kern.hv_vmm_present` 伪装成虚拟机 |
+| 驱动 | macOS **从没有过**这些 PC 硬件的驱动，要靠社区 kext 垫出来 | Apple **写过**这些驱动，只是新系统删了，搬回来即可 |
+| ACPI | PC 的 ACPI 是给 Windows 写的，要补一堆 SSDT | Mac 的 ACPI 本来就是 Apple 给 macOS 写的，基本不用动 |
+| BIOS/固件设置 | 要进 BIOS 关 CFG Lock、CSM、Secure Boot，开 Above 4G 等 | Apple UEFI 没有这些选项，只能用内存补丁绕 |
+| 系统卷签名 | 一般不用碰（注入 kext 就够） | **必须**破坏并重建快照，否则驱动补不进去 |
+
+### F.3 关键差别逐条说明
+
+#### 1) SMBIOS：一个必须伪装，一个尽量不伪装
+
+黑苹果**必须**选一个机型来冒充，而且这个选择很关键：
+
+- 机型决定 macOS 用哪套 CPU 电源管理（`X86PlatformPlugin` 的配置就是按机型查表的）；
+- 机型决定核显的 framebuffer 布局；
+- 机型决定能不能用 App Store、iMessage、FaceTime——这也是黑苹果圈“**三码/洗白**”（Serial Number、Board Serial/MLB、SmUUID/ROM）的由来：要生成一组格式合法、且没被别人占用的序列号。
+
+OCLP 正相反。附录 D.4 提过，新版 OCLP 在大多数机型上**默认不伪装 SMBIOS**，只做 Board ID 豁免，因为：
+
+- 这台机器的真机型信息（`MacBookPro11,4`）本来就是 Apple 认的，电源管理、framebuffer 查表全都对得上；
+- 真机有合法的原厂三码，iMessage/FaceTime 天然可用，不存在“洗白”问题；
+- 伪装反而会引入副作用（电源管理查错表、功能开关错乱）。
+
+OCLP 只在少数情况下才伪装（Minimal / Moderate / Advanced 三档），比如某些机型必须装成新机才能拿到某个功能。
+
+> 换句话说：**黑苹果骗的是身份，OCLP 骗的是年龄。**
+
+#### 2) 驱动来源：一个是“造”，一个是“捡回来”
+
+| | 黑苹果 | OCLP |
+|---|---|---|
+| 声卡 | `AppleALC` + `layout-id`，把 Realtek 声卡伪装成 Apple 认识的编解码器 | 不需要，原厂声卡驱动一直在 |
+| 有线网卡 | `IntelMausi` / `RealtekRTL8111` 等社区驱动 | 不需要 |
+| Wi-Fi/蓝牙 | `AirportItlwm` / `itlwm` + `IntelBluetoothFirmware`，或者干脆换一张免驱的博通网卡 | `IO80211FamilyLegacy` + `IOSkywalkFamily`，是 **Apple 自己的旧版驱动栈** |
+| 显卡 | `WhateverGreen` 注入 device-id / 伪装成支持的型号；N 卡在 Ventura 之后基本无解 | 把 Apple 删掉的 `intel_haswell` 驱动、Metal 3802 框架、Monterey 的 GVA/OpenCL **整套搬回系统卷** |
+| USB | 自己用 USBToolBox/Hackintool 逐个端口测出来，做定制映射 | OCLP 内置各机型已知的端口映射 |
+
+黑苹果的驱动是**社区逆向 + 垫片**，本质是让 macOS 把陌生硬件错认成熟悉硬件；
+OCLP 的驱动是**Apple 自己的历史代码**（来自 PatcherSupportPkg、MetallibSupportPkg），只是被新系统删掉了，OCLP 把旧版本文件搬回来。
+
+这也是 OCLP 兼容性上限的来源：附录 B 的动态壁纸卡顿，根子就在于搬回来的是 **macOS 12 时代的图形栈**，它不是为 macOS 15 的渲染管线设计的。
+
+#### 3) 根卷补丁：最大的结构性差异
+
+这是两者最不一样的地方。
+
+- **黑苹果基本不需要根卷补丁**。PC 硬件通常比 macOS 还新，缺的只是驱动 kext，而 kext 在启动时注入就行，完全不用动系统卷。所以黑苹果的系统卷是**完整密封的**，SIP 甚至可以开得比较高。
+- **OCLP 非常依赖根卷补丁**。显卡驱动不只是一个 kext，还包括用户空间的框架、着色器编译器、Metal 库，必须实际写进 `/System/Library/`（见附录 D.5）。为此必须先在启动期关掉 `Disable Root Hash validation`，破坏系统卷签名，再重建快照。
+
+由此派生出一连串体验差异：
+
+| | 黑苹果 | OCLP |
+|---|---|---|
+| macOS 更新后 | 一般直接可用，最多重装一次 EFI | **根卷补丁会被冲掉**，显卡卡顿、Wi-Fi 消失，要重打（OCLP 有后台服务弹窗提醒） |
+| 系统卷状态 | 密封完好 | 签名被破坏（Broken Seal） |
+| SIP | 可以只放宽一点点，很多配置能接近全开 | 必须关掉 Kext Signing 和 Filesystem Protections（本机 `csr-active-config = 0x803`） |
+| FileVault | 正常可用 | 需要专门的 `Force FileVault on Broken Seal` 补丁才能用 |
+
+#### 4) ACPI：黑苹果的重头戏，OCLP 几乎不碰
+
+黑苹果要往 `EFI/OC/ACPI/` 里塞一堆 SSDT，典型的有：
+
+| SSDT | 干什么 |
+|---|---|
+| `SSDT-PLUG` | 给 CPU 加上 `plugin-type=1`，macOS 才会接管 CPU 电源管理 |
+| `SSDT-EC` / `SSDT-EC-USBX` | 伪造一个 macOS 认识的嵌入式控制器，并提供 USB 供电属性 |
+| `SSDT-AWAC` | 300 系以后主板的 RTC 时钟问题 |
+| `SSDT-PMC` | 让 NVRAM 在部分主板上能正常写入 |
+| `SSDT-PLUG/HPET/RTC0` 等 | 修中断路由 |
+
+原因很简单：PC 的 DSDT 是主板厂商按 Windows 的期望写的，很多设备名、方法名 macOS 根本不认。
+
+真 Mac 的 ACPI 表是 Apple 自己写给 macOS 用的，天然是对的。OCLP 的 ACPI 补丁非常少，多半只是个别设备重命名（见附录 D.3 的 `XHC1→SHC1`）。
+
+#### 5) 固件层：一个能进 BIOS，一个不能
+
+黑苹果装机前的标准动作是进 BIOS 改设置：关 CFG Lock、关 CSM、关 Secure Boot、开 Above 4G Decoding、关 VT-d（或用 `dart=0`）等。
+
+Mac 的 Apple UEFI **没有 setup 界面**，什么都改不了。所以 OCLP 只能在软件层绕：
+
+- CFG Lock 这类锁，用 OpenCore 的 `AppleCpuPmCfgLock` / `AppleXcpmCfgLock` 在内存里修补内核，而不是去 BIOS 里关；
+- 本次修复的 BD PROCHOT 也是同样的处境——台式机 BIOS 里往往有现成开关，甚至可以在 Linux 下 `wrmsr 0x1FC` 直接写寄存器（见附录 E.8），而这台 MacBook **只能靠加载 SimpleMSR.kext 来写**。
+
+> 这是一个很典型的对照：**黑苹果缺的是驱动，真 Mac 缺的是设置入口。**
+
+#### 6) 硬件选择的自由度刚好相反
+
+- 黑苹果：硬件**可以随便选，但必须挑对**。显卡只能选 macOS 支持的（AMD 为主，N 卡在 Ventura 之后基本告别）；网卡蓝牙要么选免驱型号，要么换卡。选错了就是无解。
+- OCLP：硬件**完全不能选，但必然兼容过**。Apple 当年一定为它写过驱动，问题只是“新系统还留着没有”。
+
+#### 7) 自动化程度
+
+- 黑苹果：要读 Dortania 的 OpenCore Install Guide，按自己的 CPU 代号/主板逐项配置 `config.plist`，自己做 USB 映射，自己抄别人的 EFI 再调。同一份 EFI 换台机器多半不能用。
+- OCLP：机型总共就那么几十种，全部已知。点 **Build and Install OpenCore** 即可，`efi_builder/` 里的代码会按机型自动决定加哪些 kext、打哪些补丁（见附录 D.4 的源码表）。
+
+### F.4 一张总对照表
+
+| 对比项 | 台式机黑苹果 | OCLP（老 Mac） |
+|---|---|---|
+| 硬件 | 普通 PC，非 Apple | Apple 原厂 Mac |
+| 引导器 | OpenCore（老方案是 Clover） | **同样是 OpenCore** |
+| EFI 分区结构 | `/EFI/OC/`，config.plist + kext + ACPI | **完全一样** |
+| SMC | 必须用 VirtualSMC 模拟 | 硬件自带，无需模拟 |
+| SMBIOS | 必须伪装成某个 Mac 机型 | 默认不伪装，只豁免 Board ID |
+| 三码 / 洗白 | 必须自己生成，否则 iMessage 不能用 | 真机原厂三码，不存在此问题 |
+| 欺骗对象 | “我是一台 Mac” | “我是一台还被支持的 Mac” / “我在虚拟机里” |
+| 驱动来源 | 社区逆向的第三方 kext | Apple 自己的旧版驱动与框架 |
+| ACPI 补丁 | 大量 SSDT，是配置重点 | 极少，个别重命名 |
+| 根卷补丁 | 基本不需要 | **核心机制，重度依赖** |
+| 系统卷签名 | 保持完好 | 被破坏，靠快照回滚 |
+| SIP | 可以放宽得比较少 | 必须关掉 Kext Signing 与 Filesystem Protections |
+| macOS 更新 | 一般直接过，等 kext 适配 | 要重打根卷补丁 |
+| 配置难度 | 高，逐机器手工调试 | 低，GUI 按机型一键生成 |
+| 能装的最高版本 | 取决于硬件（尤其显卡）与社区 kext | 取决于 OCLP 是否适配该系统 |
+| 硬件维修/保修 | 不适用 | 软件层改动可完全撤销，硬件不受影响 |
+| 许可协议 | 违反 macOS EULA（只允许在 Apple 硬件上运行） | 同样违反（运行在未授权的系统版本上），但跑在真 Apple 硬件上 |
+
+### F.5 为什么 OCLP 更省心，却更容易“被更新打回原形”
+
+一句话：**黑苹果的补丁全在 EFI 分区里，macOS 碰不到；OCLP 有一半补丁在系统卷里，macOS 更新时会整个替换掉。**
+
+- 黑苹果的 kext 是启动时注入内存的，系统卷始终是 Apple 原版，所以小版本更新一般不影响（风险在于 Apple 改了内核结构，某个 kext 需要跟进）。
+- OCLP 的显卡、Wi-Fi、摄像头驱动是**写进系统卷**的。macOS 更新会用 Apple 的新快照整个替换系统卷，补丁随之消失——这就是附录 D.5 里“更新后要重打根卷补丁”的原因。
+
+反过来，OCLP 在**配置上**省心得多：机型有限且已知，社区已经替你调好了；黑苹果每台机器都是新题。
+
+### F.6 本次问题如果发生在黑苹果上
+
+以本文的 CPU 被锁 800MHz 为例：
+
+| | 本机（OCLP + MacBook） | 如果是台式机黑苹果 |
+|---|---|---|
+| 病因 | 老化电池让 SMC 误拉 BD PROCHOT | 台式机没有电池，几乎不会出现这个病因 |
+| 诊断 | `pmset -g therm`、`sysctl machdep.xcpm.*` | **命令完全一样** |
+| 修复手段 | 只能加载 SimpleMSR.kext（通过 OpenCore 注入） | 同样可以用 SimpleMSR；也可能直接在 BIOS 里关掉相关选项 |
+| 重置 SMC | 有效（真 SMC 芯片） | 不适用，没有 SMC |
+| CPU 电源管理调优 | OCLP 已按机型配好 | 要自己配 `SSDT-PLUG` + `CPUFriend`，否则可能不睿频或不降频 |
+
+诊断层面两者几乎没有区别——因为跑的是同一个 XNU 内核，看到的是同一批 sysctl 和 IOKit 节点。区别只在**修复的入口**：黑苹果多一个 BIOS 可以进，真 Mac 只能靠 kext。
+
+### F.7 术语对照
+
+给两边的说法做个映射，看社区文档时不至于对不上：
+
+| 黑苹果圈的说法 | 在 OCLP 语境里 |
+|---|---|
+| EFI 文件夹 / 抄 EFI | OCLP 的 **Build and Install OpenCore** 自动生成，不用抄 |
+| 仿冒机型 / 机型定义 | SMBIOS 伪装（OCLP 默认关闭） |
+| 三码、洗白 | 不需要，真机自带合法三码 |
+| 免驱网卡 | 老 Mac 自带的博通网卡，本来就是 Apple 用的那批 |
+| 驱动（kext） | 分两层：启动期注入的 kext + 根卷补丁里的框架 |
+| 打补丁 | 要区分**启动期补丁**和**根卷补丁**（附录 D.6） |
+| OC / Clover | OCLP 只用 OpenCore，没有 Clover 分支 |
+| 变砖 | OCLP 不刷固件，Apple 原生启动菜单（开机按 Option）始终可用 |
+
+### F.8 小结
+
+- **同源**：同一个 OpenCore 引导器、同一套 kext 注入与内核补丁机制。问“有没有补丁驱动、引导欺骗”——有，而且是同一套技术。
+- **反向**：黑苹果是把**假硬件**装成真 Mac；OCLP 是把**真硬件**装成还没过期的 Mac。
+- **最大的技术差异**：根卷补丁。黑苹果不需要，OCLP 离不开——这也决定了 OCLP 必须破坏系统卷签名、必须在每次系统更新后重打补丁。
+- **难度相反**：黑苹果难在前期配置（每台机器都要自己调），OCLP 难在后期维护（每次更新都可能要重来）。
 
 ---
 
