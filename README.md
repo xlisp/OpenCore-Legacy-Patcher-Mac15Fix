@@ -67,6 +67,20 @@ CPU Power notify
 - `CPU_Scheduler_Limit = 40`：调度器也只允许用 40% 的算力。
 - 但同时显示 `No thermal warning level has been recorded`：**macOS 自己并没有记录到过热警告**。
 
+* 修复电池和固定电池pcb板子检测电池健康OK后
+```
+❯ pmset -g therm
+
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+2026-10-23 13:43:41 +0800 CPU Power notify
+	CPU_Scheduler_Limit 	= 100
+	CPU_Available_CPUs 	= 8
+	CPU_Speed_Limit 	= 100
+
+~
+❯
+```
 ### 2.3 查看 XCPM 硬件频率上限（关键发现二）
 
 Haswell 及更新的 Intel CPU 在 macOS 下由 XCPM（XNU CPU Power Management）管理电源：
@@ -86,6 +100,24 @@ machdep.xcpm.soft_plimit_max_100mhz_ratio: 34   ← 软上限 = 3.4GHz（正常�
 **CPU 的硬上限被锁在了 800MHz**，这台机器正常应该是 3.4GHz。
 
 `hard_plimit` 是由硬件信号强制施加的上限，最常见的来源是主板/SMC 拉起的 **BD PROCHOT**（Bi-Directional Processor Hot）信号。
+
+* 修复电池和检测电池模块之后
+```
+~/PyPro/OpenCore-Legacy-Patcher-Mac15Fix main*
+❯ sysctl machdep.xcpm  | grep machdep.xcpm.hard_plimit_max_100mhz_ratio
+machdep.xcpm.hard_plimit_max_100mhz_ratio: 34
+
+~/PyPro/OpenCore-Legacy-Patcher-Mac15Fix main*
+❯ sysctl machdep.xcpm  | grep machdep.xcpm.hard_plimit_min_100mhz_ratio
+machdep.xcpm.hard_plimit_min_100mhz_ratio: 8
+
+~/PyPro/OpenCore-Legacy-Patcher-Mac15Fix main*
+❯ sysctl machdep.xcpm  | grep machdep.xcpm.soft_plimit_max_100mhz_ratio
+machdep.xcpm.soft_plimit_max_100mhz_ratio: 34
+
+~/PyPro/OpenCore-Legacy-Patcher-Mac15Fix main*
+❯
+```
 
 ### 2.4 查看电池健康（关键发现三）
 
